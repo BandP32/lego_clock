@@ -1,0 +1,407 @@
+//**************************************************************//
+// Martin's Lego Uhr
+// von: Saskia und Lars
+// #############
+// - used RealTimeClock: DS3231
+// - extracting/seperating the digits for display
+// - automatically set wintertime and summertime
+// - Corrects for wintertime and summertime if clock is powered down for a longer period
+// - Filling up 8 bit shift register by 11 bit arrays (weil jede Zahl besteht aus 11 LEDs)
+//**************************************************************//
+
+// Verwendete Libraries
+#include <EEPROM.h>     // EEPROM library for permanently storing summertime state
+#include <DS3231.h>     // RealTimeClock DS3231 library from http://www.rinkydinkelectronics.com
+
+// Init the DS3231 using the hardware interface
+DS3231  rtc(SDA, SCL);
+
+// Init a Time-data structure
+Time  t;
+
+//Pin connected to ST_CP of 74HC595
+int latchPin = 8;
+//Pin connected to SH_CP of 74HC595
+int clockPin = 12;
+////Pin connected to DS of 74HC595
+int dataPin = 11;
+
+
+// Definitionen von Arrays und Variablen
+
+unsigned int shift_array[6][8]; // array of the shift registers
+
+int hour1;  // hour first digit
+int hour2;  // hour second digit
+int min1;   // minute first digit
+int min2;   // minute second digit
+int sec1;   // second first digit
+int sec2; // second second digit
+
+int addr = 0;       // byte memory adress of EEPROM (must be between 0 and 255)
+bool summertime;    // 1=summertime, 0=wintertime
+
+static const uint8_t dim[] = { 31,28,31,30,31,30,31,31,30,31,30,31 };     // last days of month of a normal year
+static const uint8_t dim_s[] = { 31,29,31,30,31,30,31,31,30,31,30,31 };   // last days of month of a leap-year
+int last_day;     // empty variable for the last day of month
+
+int array_i = 4; // clock-digit array elements 
+
+int b_r; // bit count per register
+
+// Mapping der 10 Ziffer der 11-bit Digits
+unsigned int map_array[11][11] = {{0,1,1,1,1,1,1,1,1,1,1},  // 0
+  {0,1,1,1,1,0,0,0,0,0,0},    // 1
+  {1,0,0,1,1,1,0,0,1,1,1},    // 2
+  {1,1,1,1,1,1,0,0,0,0,1},    // 3
+  {1,1,1,1,1,0,1,1,0,0,0},    // 4
+  {1,1,1,0,0,1,1,1,0,0,1},    // 5
+  {1,1,1,0,0,1,1,1,1,1,1},    // 6
+  {0,1,1,1,1,1,0,0,0,0,0},    // 7
+  {1,1,1,1,1,1,1,1,1,1,1},    // 8
+  {1,1,1,1,1,1,1,1,0,0,1}     // 9
+  };
+  
+unsigned int clock_array[5][11];      // eigtl wuerden 4 digits reichen, aber speicherplatz muss reserviert werden
+
+int sum=0;    // Variable fuer die Summenbildung der Shift-register
+
+
+// Setup
+void setup() {
+  
+  //Start Serial for debuging purposes  
+  Serial.begin(9600);
+  //Serial.println("Begin");
+  //set pins to output because they are addressed in the main loop
+  pinMode(latchPin, OUTPUT);
+
+  // read summertime variable from the EEPROM
+  summertime = EEPROM.read(addr);
+  // summertime = 1;    // switch summertime manually: 1 = summertime; 0 = wintertime
+//  Serial.print("read from EEPROM. summertime state is: ");
+//  Serial.print(summertime);
+//  Serial.print(" ");
+  
+  // Initialize the rtc object
+  rtc.begin();
+  
+    // The following lines can be uncommented to set the date and time manually
+  //rtc.setDOW(SUNDAY);     // Set Day-of-Week to SUNDAY
+  //rtc.setTime(15, 37, 0);     // Set the time to 12:00:00 (24hr format)
+  //rtc.setDate(30, 3, 2018);   // Set the date (d, m, y)
+  
+// checking for wintertime and summertime and if the variable "summertime" is wrongly set correct it + set the time + set the date correctly
+  t = rtc.getTime();
+  if ((t.mon > 10 || t.mon < 2) || ( t.mon == 10 && t.date <= 25) || ( t.mon == 10 && t.date >= 25 && t.dow == 7 && t.hour >= 3) || 
+    ( t.mon == 10 && t.date >= 26 && t.dow<=1 ) || ( t.mon == 10 && t.date >= 27 && t.dow<=2 ) || 
+    ( t.mon == 10 && t.date >= 28 && t.dow<=3 ) || ( t.mon == 10 && t.date >= 29 && t.dow<=4 ) || 
+    ( t.mon == 10 && t.date >= 30 && t.dow<=5 ) || 
+    ( t.mon == 3 && t.date <= 24) || ( t.mon == 3 && t.date <= 30 && t.date >= 25 && !(t.dow == 7))){
+    Serial.print("It's wintertime! ");
+    if (summertime == 1){
+      
+      Serial.print("But the clock is set to summertime :-( ");
+      Serial.print("Setting time 1 hour back");
+      
+      // edge case: 00 hours
+      if (t.hour == 0){
+        rtc.setTime(23, t.min, t.sec);     // -> set hour to 23                  
+        int date_compare = t.date; 
+        rtc.setDate(t.date - 1, t.mon, t.year);          // ... and set the date - 1 day, hoping that it's not the first day of the month...
+        if (t.date == date_compare){      // if date could not be set -1day, because it was the first day of month
+          int mon_compare = t.mon;
+          int mon_minus1 = t.mon-2;   // -2 because the arrays dim + dim_s begin to count at number 0
+
+          if (t.mon == 1) {   // else => January the first in the midnight hour, so setting the clock 1 hour back means:
+            rtc.setDate(31, 12, t.year-1);   // Happy Newyearseve again!
+            }
+          
+          else if ((t.mon -1) == 2){ // if the month is February then check if we are in a leap-year
+              // check for active leap-year starting from 2016 until 2400 ... should suffice ;-)
+              for (int y = 2016; y < 2400; y = y + 4){    // loop every 4 years
+                if (t.year == y){          
+     
+                  last_day = dim_s[mon_minus1];     // selecting leap-year-array entry for last day of month
+                  }
+                else {
+                  last_day = dim[mon_minus1];     // last day of a normal year february
+                  }
+                }
+            }
+          else if (((t.mon -1) == 1) || ((t.mon - 1) > 2) && ((t.mon - 1) < 13)){
+            last_day = dim[mon_minus1];     // selecting the normal-year array for the last day of the month
+            }
+          rtc.setDate(last_day, t.mon-1, t.year);   // 
+          }
+        }
+      // end of edge case: 00 hours
+        
+      else{
+        rtc.setTime(t.hour-1, t.min, t.sec);     // Simply set the clock 1 hour back
+        }
+        
+      
+      summertime = 0;   // switch to wintertime
+      EEPROM.write(addr, summertime);   // write summertime variable to EEPROM (variable is permanently saved even without power)
+      }
+    }
+
+  if (!((t.mon > 10 || t.mon < 2) || ( t.mon == 10 && t.date <= 25) || ( t.mon == 10 && t.date >= 25 && t.dow == 7 && t.hour >= 3) || 
+    ( t.mon == 10 && t.date >= 26 && t.dow<=1 ) || ( t.mon == 10 && t.date >= 27 && t.dow<=2 ) || 
+    ( t.mon == 10 && t.date >= 28 && t.dow<=3 ) || ( t.mon == 10 && t.date >= 29 && t.dow<=4 ) || 
+    ( t.mon == 10 && t.date >= 30 && t.dow<=5 ) || 
+    ( t.mon == 3 && t.date <= 24) || ( t.mon == 3 && t.date <= 30 && t.date >= 25 && !(t.dow == 7))))
+    {
+//  if (!((t.mon > 10 || t.mon < 2) || ( t.mon == 10 && t.date >= 26 && t.dow>=1 && t.dow<=6) || ( t.mon == 3 && t.date <= 24) || ( t.mon == 3 && t.date <= 30 && t.date >= 25 && !(t.dow == 7)))){
+
+    Serial.print("It's summertime! ");
+    if (summertime == 0){
+      Serial.print("But the clock is set to wintertime :-( ");
+      Serial.print("Setting time +1 hour");
+
+      // edge case: 23 hours
+      if (t.hour == 23){                  
+        rtc.setTime(0, t.min, t.sec);     // -> set hour to 0
+        int date_compare = t.date; 
+        rtc.setDate(t.date + 1, t.mon, t.year);          // ... and set the date + 1 day, hoping that it's not the last day of the month...
+        if (t.date == date_compare){      // if date could not be set +1day
+          int mon_compare = t.mon;
+          rtc.setDate(1, t.mon+1, t.year);    // setting the day to 0 and the month + 1
+        }
+      }
+      // end of edge case: 23 hours
+
+      else {
+        rtc.setTime(t.hour+1, t.min, t.sec);     // Set the time
+      }
+      
+      summertime = 1;   // switch to summertime
+      EEPROM.write(addr, summertime);   // write summertime to EEPROM (variable is permanently saved even without power)
+      Serial.print("switching to summertime and saving to EEPROM");
+      }
+    }
+}
+
+
+// Loop
+void loop() {
+  // Get data from the DS3231 Real Time Clock
+  t = rtc.getTime();
+
+  // Set to wintertime
+  if (t.mon == 10 && t.date >= 25 && t.dow == 7 && t.hour >= 3 && summertime == 1){
+    // Serial.print("It's October, more or equal than the 25. and Sunday: You must change the clock at 3 o'clock to 2 ");
+    rtc.setTime(t.hour - 1, t.min, t.sec);     // Set the time to 02:00:00 (24hr format)
+    summertime = 0;   // switch to wintertime
+    EEPROM.write(addr, summertime);   // write summertime to EEPROM
+  }
+
+  // Set to summertime
+  if (rtc.getMonthStr()=="March" && t.date >= 25 && t.dow == 7 && t.hour >= 2 && summertime == 0){
+    // Serial.print("It's October, more or equal than the 25. and Sunday and 2 o clock: You must change the clock to +1 hour to 3 ");
+    rtc.setTime(t.hour + 1, t.min, t.sec);     // Set the time to 03:00:00 (24hr format)
+    summertime = 1;   // switch to summertime
+    EEPROM.write(addr, summertime);   // write summertime to EEPROM
+  }
+
+  // Selecting the numbers of the hours and minutes and put them into variables:
+  //(x % 10) gives you the last digit. x = x / 10 removes the last digit, 
+  //so (x / 10) % 10 gives you the second-to-last digit, and so on...
+  if (t.hour<10){       // adds the 0 to the first digit if it is before 10
+    hour1=0;
+    hour2=t.hour;
+  }
+  else
+    hour1=t.hour/10;    // "selects" the first number
+    hour2=t.hour % 10;  // "selects" the second number
+
+  if (t.min<10){        // adds 0 to the first digit if minutes < 10
+    min1=0;             // first digit
+    min2=t.min;         // second digit
+  }
+  else
+    min1=t.min/10;      // "selects" the first number
+    min2=t.min % 10;    // "selects" the second number
+
+    
+  if (t.sec<10){        // adds 0 to the first digit if seconds are < 10
+    sec1=0;             // first digit
+    sec2=t.sec;         // second digit
+  }
+  else
+    sec1=t.sec/10;      // "selects" the first number
+    sec2=t.sec % 10;    // "selects" the first number
+  
+
+  // die 4 digits in das clock_array packen
+  for (int x = 0; x < 11; x++) {
+    clock_array[3][x] = map_array[hour1][x];
+
+  }
+  for (int x = 0; x < 11; x++) {
+    clock_array[2][x] = map_array[hour2][x];
+  }
+  for (int x = 0; x < 11; x++) {
+    clock_array[1][x] = map_array[min1][x];
+  }
+  for (int x = 0; x < 11; x++) {
+    clock_array[0][x] = map_array[min2][x];
+//    Serial.print("min2 ");
+//    Serial.println(clock_array[0][x]);
+  }
+
+  int i=0; // counter array bits
+  int d=0; // digit position (m2 m1 h2 h1)
+  // fill the registers
+  for (int r=0; r < 6; r++){
+//    Serial.print("shift Register nr");
+//    Serial.println(r);
+    int c = 7;
+    for (int b=0; b < 8; b++){    
+
+// Register Positionen und Values zum debuggen:
+//        Serial.print("register                          ");    // register
+//        Serial.println(r);    // register
+//        Serial.print("bit pos of current register       ");
+//        Serial.println(b);    // bit pos of current register
+//        Serial.print("bit of the 11-bit digits(i)       ");
+//        Serial.println(i);    // current bit of the 11-bit digits
+//        Serial.print("11bit digit number 0-3            ");
+//        Serial.println(d);    // 11bit digit number 0-3
+//        Serial.print("conten of clock array             ");
+//        Serial.println(clock_array[d][i]);    // content of clock_array
+//        Serial.println('-');
+
+        // ersten 4 Pins des Shift Registers ausschalten (sind nicht belegt)
+        if (b < 4 && r == 0){
+          // Serial.println("r ist 0 und b ist kleiner 4");
+          shift_array[r][b] = 0;
+        }
+        
+        else if (clock_array[d][i] > 0){
+// debugging messages
+//          Serial.print("clock_array");
+//          Serial.println(clock_array[d][i]);
+//          Serial.print("b");
+//          Serial.println(b);
+//          Serial.println(pow(2,c));
+          // float a=2,2; int b=(int)a;
+          float cf = (float)c;
+          float pc = pow(2,cf)+0.5;   // damit nicht abgerundet wird...
+          int ic=(int)pc;
+          // debugging messages
+//          Serial.print("ic ");
+//          Serial.println(ic);
+          shift_array[r][b] = ic;    //
+          i++; // next bit of the 11bit digit
+        }
+        
+        else if (clock_array[d][i] < 1) {
+//          Serial.print("clock_array");
+//          Serial.println(clock_array[d][i]);
+          shift_array[r][b] = 0;
+//          Serial.println(0);
+          i++; // next bit of the 11bit digit
+        }
+  
+//        Serial.print("shift_array[r][b]                 ");
+//        Serial.println(shift_array[r][b]);
+//        Serial.println('-');
+        
+        c--; // next bit from high to low
+        
+        if (i > 10){    // if all 11 bits are in the register:
+          d++;    // next digit
+          i=0;    // reset counter 
+          }
+        
+    }
+  } 
+//  Serial.println("FERTIIIIIIIIIICH mit den Register befuellen");
+
+// Shift register ausloesen:
+//ground latchPin and hold low for as long as you are transmitting
+  //delay(1000);
+  digitalWrite(latchPin, 0);
+  // send data
+  for (int i=0; i<6; i++)  {
+    shiftOut(dataPin, clockPin, 0b00000000); 
+  }
+  //return the latch pin high to signal chip that it 
+  //no longer needs to listen for information
+  digitalWrite(latchPin, 1);
+  // delay(1000);
+  for (int m=0; m<6; m++){
+    
+    //ground latchPin and hold low for as long as you are transmitting
+    digitalWrite(latchPin, 0);
+    // send data
+    for (int i=0; i<6; i++)  {
+      sum = 0;
+//      Serial.print("register");
+//      Serial.println(i);
+      for (int b=0; b < 8; b++){
+//        Serial.print("bit nr ");
+//        Serial.print(b);
+//        Serial.print("shift_array");
+//        Serial.println(shift_array[i][b]);
+        sum = shift_array[i][b] + sum;
+    }
+//      Serial.print("SUM");
+//      Serial.println(sum);
+      shiftOut(dataPin, clockPin, sum);     
+    }
+    //return the latch pin high to signal chip that it 
+    //no longer needs to listen for information
+    digitalWrite(latchPin, 1);
+  }
+  delay(60000);   // Uhr wird alle 60 Sekunden aktualisiert
+}  
+
+// Funktion zum Senden der integer Werte (8Bit) an ein Shift register
+void shiftOut(int myDataPin, int myClockPin, byte myDataOut) {
+  // This shifts 8 bits out MSB first, 
+  //on the rising edge of the clock,
+  //clock idles low
+
+//internal function setup
+  int i=0;
+  int pinState;
+  pinMode(myClockPin, OUTPUT);
+  pinMode(myDataPin, OUTPUT);
+
+//clear everything out just in case to
+//prepare shift register for bit shifting
+  digitalWrite(myDataPin, 0);
+  digitalWrite(myClockPin, 0);
+
+  //for each bit in the byte myDataOut�
+  //NOTICE THAT WE ARE COUNTING DOWN in our for loop
+  //This means that %00000001 or "1" will go through such
+  //that it will be pin Q0 that lights. 
+  for (i=7; i>=0; i--)  {
+    digitalWrite(myClockPin, 0);
+
+    //if the value passed to myDataOut and a bitmask result 
+    // true then... so if we are at i=6 and our value is
+    // %11010100 it would the code compares it to %01000000 
+    // and proceeds to set pinState to 1.
+    if ( myDataOut & (1<<i) ) {
+      pinState= 1;
+    }
+    else {  
+      pinState= 0;
+    }
+
+    //Sets the pin to HIGH or LOW depending on pinState
+    digitalWrite(myDataPin, pinState);
+    //register shifts bits on upstroke of clock pin  
+    digitalWrite(myClockPin, 1);
+    //zero the data pin after shift to prevent bleed through
+    digitalWrite(myDataPin, 0);
+  }
+
+  //stop shifting
+  digitalWrite(myClockPin, 0);
+}
